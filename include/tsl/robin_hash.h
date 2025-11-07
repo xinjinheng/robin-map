@@ -468,6 +468,8 @@ template <class ValueType, class KeySelect, class ValueSelect, class Hash, class
     robin_iterator& operator=(robin_iterator&& other) = default;
 
     const typename robin_hash::key_type& key() const {
+      tsl_rh_assert(m_bucket != nullptr, "Iterator is null.");
+      tsl_rh_assert(!m_bucket->empty() || m_bucket->last_bucket(), "Iterator is pointing to an invalid bucket.");
       return KeySelect()(m_bucket->value());
     }
 
@@ -475,6 +477,8 @@ template <class ValueType, class KeySelect, class ValueSelect, class Hash, class
               typename std::enable_if<has_mapped_type<U>::value &&
                                       IsConst>::type* = nullptr>
     const typename U::value_type& value() const {
+      tsl_rh_assert(m_bucket != nullptr, "Iterator is null.");
+      tsl_rh_assert(!m_bucket->empty() || m_bucket->last_bucket(), "Iterator is pointing to an invalid bucket.");
       return U()(m_bucket->value());
     }
 
@@ -482,12 +486,22 @@ template <class ValueType, class KeySelect, class ValueSelect, class Hash, class
               typename std::enable_if<has_mapped_type<U>::value &&
                                       !IsConst>::type* = nullptr>
     typename U::value_type& value() const {
+      tsl_rh_assert(m_bucket != nullptr, "Iterator is null.");
+      tsl_rh_assert(!m_bucket->empty() || m_bucket->last_bucket(), "Iterator is pointing to an invalid bucket.");
       return U()(m_bucket->value());
     }
 
-    reference operator*() const { return m_bucket->value(); }
+    reference operator*() const {
+      tsl_rh_assert(m_bucket != nullptr, "Iterator is null.");
+      tsl_rh_assert(!m_bucket->empty() || m_bucket->last_bucket(), "Iterator is pointing to an invalid bucket.");
+      return m_bucket->value();
+    }
 
-    pointer operator->() const { return std::addressof(m_bucket->value()); }
+    pointer operator->() const {
+      tsl_rh_assert(m_bucket != nullptr, "Iterator is null.");
+      tsl_rh_assert(!m_bucket->empty() || m_bucket->last_bucket(), "Iterator is pointing to an invalid bucket.");
+      return std::addressof(m_bucket->value());
+    }
 
     robin_iterator& operator++() {
       while (true) {
@@ -1042,9 +1056,11 @@ template <class ValueType, class KeySelect, class ValueSelect, class Hash, class
   const_iterator find_impl(const K& key, std::size_t hash) const {
     std::size_t ibucket = bucket_for_hash(hash);
     distance_type dist_from_ideal_bucket = 0;
+    const size_type max_probes = m_bucket_count + 1; // Add 1 to cover all buckets
+    size_type probe_count = 0;
 
     while (dist_from_ideal_bucket <=
-           m_buckets[ibucket].dist_from_ideal_bucket()) {
+           m_buckets[ibucket].dist_from_ideal_bucket() && probe_count < max_probes) {
       if (TSL_RH_LIKELY(
               (!USE_STORED_HASH_ON_LOOKUP ||
                m_buckets[ibucket].bucket_hash_equal(hash)) &&
@@ -1054,6 +1070,7 @@ template <class ValueType, class KeySelect, class ValueSelect, class Hash, class
 
       ibucket = next_bucket(ibucket);
       dist_from_ideal_bucket++;
+      probe_count++;
     }
 
     return cend();
@@ -1097,9 +1114,11 @@ template <class ValueType, class KeySelect, class ValueSelect, class Hash, class
 
     std::size_t ibucket = bucket_for_hash(hash);
     distance_type dist_from_ideal_bucket = 0;
+    const size_type max_probes = m_bucket_count + 1; // Add 1 to cover all buckets
+    size_type probe_count = 0;
 
     while (dist_from_ideal_bucket <=
-           m_buckets[ibucket].dist_from_ideal_bucket()) {
+           m_buckets[ibucket].dist_from_ideal_bucket() && probe_count < max_probes) {
       if ((!USE_STORED_HASH_ON_LOOKUP ||
            m_buckets[ibucket].bucket_hash_equal(hash)) &&
           compare_keys(KeySelect()(m_buckets[ibucket].value()), key)) {
@@ -1108,6 +1127,7 @@ template <class ValueType, class KeySelect, class ValueSelect, class Hash, class
 
       ibucket = next_bucket(ibucket);
       dist_from_ideal_bucket++;
+      probe_count++;
     }
 
     while (rehash_on_extreme_load(dist_from_ideal_bucket)) {
@@ -1194,29 +1214,40 @@ template <class ValueType, class KeySelect, class ValueSelect, class Hash, class
   }
 
   void rehash_impl(size_type count_) {
+    // Create a new table with the new bucket count
     robin_hash new_table(count_, static_cast<Hash&>(*this),
                          static_cast<KeyEqual&>(*this), get_allocator(),
                          m_min_load_factor, m_max_load_factor);
     tsl_rh_assert(size() <= new_table.m_load_threshold);
 
-    const bool use_stored_hash =
+    const bool use_stored_hash = 
         USE_STORED_HASH_ON_REHASH(new_table.bucket_count());
-    for (auto& bucket : m_buckets_data) {
-      if (bucket.empty()) {
-        continue;
+    
+    // Try to insert all elements into the new table
+    try {
+      for (auto& bucket : m_buckets_data) {
+        if (bucket.empty()) {
+          continue;
+        }
+
+        const std::size_t hash = 
+            use_stored_hash ? bucket.truncated_hash()
+                            : new_table.hash_key(KeySelect()(bucket.value()));
+
+        new_table.insert_value_on_rehash(new_table.bucket_for_hash(hash), 0,
+                                         bucket_entry::truncate_hash(hash),
+                                         std::move(bucket.value()));
       }
 
-      const std::size_t hash =
-          use_stored_hash ? bucket.truncated_hash()
-                          : new_table.hash_key(KeySelect()(bucket.value()));
-
-      new_table.insert_value_on_rehash(new_table.bucket_for_hash(hash), 0,
-                                       bucket_entry::truncate_hash(hash),
-                                       std::move(bucket.value()));
+      new_table.m_nb_elements = m_nb_elements;
+      new_table.swap(*this);
+    } catch (const std::bad_alloc& e) {
+      // Memory allocation failed during rehash, log the error and return
+      TSL_RH_THROW_OR_TERMINATE(std::bad_alloc, "Memory allocation failed during rehash.");
+    } catch (...) {
+      // Other exceptions during rehash, log the error and return
+      TSL_RH_THROW_OR_TERMINATE(std::runtime_error, "Unexpected error during rehash.");
     }
-
-    new_table.m_nb_elements = m_nb_elements;
-    new_table.swap(*this);
   }
 
   void clear_and_shrink() noexcept {
@@ -1283,43 +1314,49 @@ template <class ValueType, class KeySelect, class ValueSelect, class Hash, class
 
   template <class Serializer>
   void serialize_impl(Serializer& serializer) const {
-    const slz_size_type version = SERIALIZATION_PROTOCOL_VERSION;
-    serializer(version);
+    try {
+      const slz_size_type version = SERIALIZATION_PROTOCOL_VERSION;
+      serializer(version);
 
-    // Indicate if the truncated hash of each bucket is stored. Use a
-    // std::int16_t instead of a bool to avoid the need for the serializer to
-    // support an extra 'bool' type.
-    const std::int16_t hash_stored_for_bucket =
-        static_cast<std::int16_t>(STORE_HASH);
-    serializer(hash_stored_for_bucket);
+      // Indicate if the truncated hash of each bucket is stored. Use a
+      // std::int16_t instead of a bool to avoid the need for the serializer to
+      // support an extra 'bool' type.
+      const std::int16_t hash_stored_for_bucket = 
+          static_cast<std::int16_t>(STORE_HASH);
+      serializer(hash_stored_for_bucket);
 
-    const slz_size_type nb_elements = m_nb_elements;
-    serializer(nb_elements);
+      const slz_size_type nb_elements = m_nb_elements;
+      serializer(nb_elements);
 
-    const slz_size_type bucket_count = m_buckets_data.size();
-    serializer(bucket_count);
+      const slz_size_type bucket_count = m_buckets_data.size();
+      serializer(bucket_count);
 
-    const float min_load_factor = m_min_load_factor;
-    serializer(min_load_factor);
+      const float min_load_factor = m_min_load_factor;
+      serializer(min_load_factor);
 
-    const float max_load_factor = m_max_load_factor;
-    serializer(max_load_factor);
+      const float max_load_factor = m_max_load_factor;
+      serializer(max_load_factor);
 
-    for (const bucket_entry& bucket : m_buckets_data) {
-      if (bucket.empty()) {
-        const std::int16_t empty_bucket =
-            bucket_entry::EMPTY_MARKER_DIST_FROM_IDEAL_BUCKET;
-        serializer(empty_bucket);
-      } else {
-        const std::int16_t dist_from_ideal_bucket =
-            bucket.dist_from_ideal_bucket();
-        serializer(dist_from_ideal_bucket);
-        if (STORE_HASH) {
-          const std::uint32_t truncated_hash = bucket.truncated_hash();
-          serializer(truncated_hash);
+      for (const bucket_entry& bucket : m_buckets_data) {
+        if (bucket.empty()) {
+          const std::int16_t empty_bucket = 
+              bucket_entry::EMPTY_MARKER_DIST_FROM_IDEAL_BUCKET;
+          serializer(empty_bucket);
+        } else {
+          const std::int16_t dist_from_ideal_bucket = 
+              bucket.dist_from_ideal_bucket();
+          serializer(dist_from_ideal_bucket);
+          if (STORE_HASH) {
+            const std::uint32_t truncated_hash = bucket.truncated_hash();
+            serializer(truncated_hash);
+          }
+          serializer(bucket.value());
         }
-        serializer(bucket.value());
       }
+    } catch (const std::exception& e) {
+      TSL_RH_THROW_OR_TERMINATE(std::runtime_error, "Serialization failed: " + std::string(e.what()));
+    } catch (...) {
+      TSL_RH_THROW_OR_TERMINATE(std::runtime_error, "Unknown serialization error.");
     }
   }
 
@@ -1327,15 +1364,16 @@ template <class ValueType, class KeySelect, class ValueSelect, class Hash, class
   void deserialize_impl(Deserializer& deserializer, bool hash_compatible) {
     tsl_rh_assert(m_buckets_data.empty());  // Current hash table must be empty
 
-    const slz_size_type version =
-        deserialize_value<slz_size_type>(deserializer);
-    // For now we only have one version of the serialization protocol.
-    // If it doesn't match there is a problem with the file.
-    if (version != SERIALIZATION_PROTOCOL_VERSION) {
-      TSL_RH_THROW_OR_TERMINATE(std::runtime_error,
-                                "Can't deserialize the ordered_map/set. "
-                                "The protocol version header is invalid.");
-    }
+    try {
+      const slz_size_type version = 
+          deserialize_value<slz_size_type>(deserializer);
+      // For now we only have one version of the serialization protocol.
+      // If it doesn't match there is a problem with the file.
+      if (version != SERIALIZATION_PROTOCOL_VERSION) {
+        TSL_RH_THROW_OR_TERMINATE(std::runtime_error,
+                                  "Can't deserialize the ordered_map/set. "
+                                  "The protocol version header is invalid.");
+      }
 
     const bool hash_stored_for_bucket =
         deserialize_value<std::int16_t>(deserializer) ? true : false;
@@ -1439,6 +1477,22 @@ template <class ValueType, class KeySelect, class ValueSelect, class Hash, class
         m_buckets_data.back().set_as_last_bucket();
       }
     }
+  } catch (const std::bad_alloc& e) {
+    // Memory allocation failed during deserialization
+    clear(); // Clean up any partially deserialized data
+    TSL_RH_THROW_OR_TERMINATE(std::bad_alloc, "Memory allocation failed during deserialization: " + std::string(e.what()));
+  } catch (const std::runtime_error& e) {
+    // Runtime errors during deserialization
+    clear(); // Clean up any partially deserialized data
+    TSL_RH_THROW_OR_TERMINATE(std::runtime_error, "Deserialization failed: " + std::string(e.what()));
+  } catch (const std::exception& e) {
+    // Other standard exceptions during deserialization
+    clear(); // Clean up any partially deserialized data
+    TSL_RH_THROW_OR_TERMINATE(std::runtime_error, "Deserialization failed with exception: " + std::string(e.what()));
+  } catch (...) {
+    // Unknown exceptions during deserialization
+    clear(); // Clean up any partially deserialized data
+    TSL_RH_THROW_OR_TERMINATE(std::runtime_error, "Unknown deserialization error.");
   }
 
  public:
@@ -1512,6 +1566,9 @@ template <class ValueType, class KeySelect, class ValueSelect, class Hash, class
    * table on the next insert if we go below the min_load_factor.
    */
   bool m_try_shrink_on_next_insert;
+
+  /** Version number for iterator validity checking */
+  size_type m_version;
 };
 
 }  // namespace detail_robin_hash
