@@ -34,6 +34,18 @@ if(MSVC)
                    "$<INSTALL_INTERFACE:${CMAKE_INSTALL_DATAROOTDIR}/tsl-robin-map.natvis>")
 endif()
 
+# Test target
+option(TSL_ROBIN_MAP_BUILD_TESTS "Build tests" ${IS_MAIN_PROJECT})
+
+if(TSL_ROBIN_MAP_BUILD_TESTS)
+    add_executable(test_safe_mode test_safe_mode.cpp)
+    target_link_libraries(test_safe_mode tsl::robin_map)
+    target_compile_features(test_safe_mode PRIVATE cxx_std_17)
+    
+    # Enable safe mode for tests
+    target_compile_definitions(test_safe_mode PRIVATE TSL_ROBIN_MAP_SAFE_MODE)
+endif()
+
 # Installation
 if(TSL_ROBIN_MAP_ENABLE_INSTALL)
     include(CMakePackageConfigHelpers)

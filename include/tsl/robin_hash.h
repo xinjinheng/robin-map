@@ -246,14 +246,14 @@ class bucket_entry : public bucket_entry_hash<StoreHash> {
     return m_dist_from_ideal_bucket == EMPTY_MARKER_DIST_FROM_IDEAL_BUCKET;
   }
 
-  value_type& value() noexcept {
-    tsl_rh_assert(!empty());
+  value_type& value() {
+    tsl_rh_safe_assert(!empty(), "Attempt to access value of empty bucket");
     return *std::launder(
         reinterpret_cast<value_type*>(std::addressof(m_value)));
   }
 
-  const value_type& value() const noexcept {
-    tsl_rh_assert(!empty());
+  const value_type& value() const {
+    tsl_rh_safe_assert(!empty(), "Attempt to access value of empty bucket");
     return *std::launder(
         reinterpret_cast<const value_type*>(std::addressof(m_value)));
   }
@@ -470,39 +470,69 @@ class robin_hash : private Hash, private KeyEqual, private GrowthPolicy {
     robin_iterator& operator=(robin_iterator&& other) = default;
 
     const typename robin_hash::key_type& key() const {
-      return KeySelect()(m_bucket->value());
+        tsl_rh_safe_assert(m_bucket != nullptr, "Attempt to access key from null iterator");
+        tsl_rh_safe_assert(!m_bucket->empty(), "Attempt to access key from iterator to empty bucket");
+        return KeySelect()(m_bucket->value());
     }
 
     template <class U = ValueSelect,
               typename std::enable_if<has_mapped_type<U>::value &&
                                       IsConst>::type* = nullptr>
     const typename U::value_type& value() const {
-      return U()(m_bucket->value());
+        tsl_rh_safe_assert(m_bucket != nullptr, "Attempt to access value from null iterator");
+        tsl_rh_safe_assert(!m_bucket->empty(), "Attempt to access value from iterator to empty bucket");
+        return U()(m_bucket->value());
     }
 
     template <class U = ValueSelect,
               typename std::enable_if<has_mapped_type<U>::value &&
                                       !IsConst>::type* = nullptr>
     typename U::value_type& value() const {
-      return U()(m_bucket->value());
+        tsl_rh_safe_assert(m_bucket != nullptr, "Attempt to access value from null iterator");
+        tsl_rh_safe_assert(!m_bucket->empty(), "Attempt to access value from iterator to empty bucket");
+        return U()(m_bucket->value());
     }
 
-    reference operator*() const { return m_bucket->value(); }
+    reference operator*() const {
+        tsl_rh_safe_assert(m_bucket != nullptr, "Attempt to dereference null iterator");
+        tsl_rh_safe_assert(!m_bucket->empty() || m_bucket->last_bucket(), "Attempt to dereference iterator to empty bucket");
+        return m_bucket->value();
+    }
 
-    pointer operator->() const { return std::addressof(m_bucket->value()); }
+    pointer operator->() const {
+        tsl_rh_safe_assert(m_bucket != nullptr, "Attempt to dereference null iterator");
+        tsl_rh_safe_assert(!m_bucket->empty() || m_bucket->last_bucket(), "Attempt to dereference iterator to empty bucket");
+        return std::addressof(m_bucket->value());
+    }
 
     robin_iterator& operator++() {
-      while (true) {
-        if (m_bucket->last_bucket()) {
-          ++m_bucket;
-          return *this;
-        }
+        tsl_rh_safe_assert(m_bucket != nullptr, "Attempt to increment null iterator");
+        tsl_rh_safe_assert(!m_bucket->last_bucket(), "Attempt to increment end iterator");
+        
+        // 防止无限循环：跟踪已检查的桶数量
+        const bucket_entry_ptr start_bucket = m_bucket;
+        const std::size_t max_steps = 10000; // 合理的最大步数限制
+        std::size_t steps = 0;
+        
+        while (true) {
+            // 检查是否达到最大步数，防止无限循环
+            tsl_rh_safe_assert(steps < max_steps, "Iterator increment reached maximum steps, possible infinite loop");
+            steps++;
+            
+            if (m_bucket->last_bucket()) {
+                ++m_bucket;
+                return *this;
+            }
 
-        ++m_bucket;
-        if (!m_bucket->empty()) {
-          return *this;
+            ++m_bucket;
+            
+            // 检查是否回到起始位置，防止循环
+            tsl_rh_safe_assert(m_bucket != start_bucket, "Iterator increment loop detected");
+            
+            if (!m_bucket->empty()) {
+                return *this;
+            }
         }
-      }
     }
 
     robin_iterator operator++(int) {
@@ -668,16 +698,35 @@ class robin_hash : private Hash, private KeyEqual, private GrowthPolicy {
   /*
    * Modifiers
    */
-  void clear() noexcept {
-    if (m_min_load_factor > 0.0f) {
-      clear_and_shrink();
-    } else {
-      for (auto& bucket : m_buckets_data) {
-        bucket.clear();
-      }
+  void clear() {
+    try {
+      // 哈希表状态一致性检查
+      tsl_rh_safe_assert(m_bucket_count == 0 || m_buckets != nullptr, "Hash table has non-zero buckets but null buckets pointer");
+      tsl_rh_safe_assert(m_bucket_count == 0 || m_buckets_data.data() != nullptr, "Hash table has non-zero buckets but null buckets data pointer");
+      
+      if (m_min_load_factor > 0.0f) {
+        clear_and_shrink();
+      } else if (m_bucket_count > 0) {
+        // 验证桶数据指针有效性
+        tsl_rh_safe_assert(m_buckets_data.data() != nullptr, "Attempt to access null buckets data pointer");
+        
+        // 清除所有桶
+        for (std::size_t i = 0; i < m_bucket_count; ++i) {
+          // 边界检查
+          tsl_rh_safe_assert(i < m_bucket_count, "Invalid bucket index during clear");
+          m_buckets_data[i].clear();
+        }
 
-      m_nb_elements = 0;
-      m_grow_on_next_insert = false;
+        // 更新状态
+        m_nb_elements = 0;
+        m_grow_on_next_insert = false;
+        m_try_shrink_on_next_insert = false;
+      }
+      
+      // 最终状态验证
+      tsl_rh_safe_assert(m_nb_elements == 0, "Clear operation failed: element count not zero");
+    } catch (...) {
+      TSL_RH_THROW_OR_TERMINATE(std::runtime_error, "Unexpected error during clear operation");
     }
   }
 
@@ -1029,13 +1078,63 @@ class robin_hash : private Hash, private KeyEqual, private GrowthPolicy {
   }
 
   void rehash(size_type count_) {
-    count_ = std::max(count_,
-                      size_type(std::ceil(float(size()) / max_load_factor())));
-    rehash_impl(count_);
+    try {
+      // 输入参数有效性检查
+      tsl_rh_safe_assert(count_ >= 0, "Invalid rehash count: must be non-negative");
+      tsl_rh_safe_assert(count_ <= max_size(), "Rehash count exceeds maximum allowed size");
+      
+      // 负载因子有效性检查
+      const float current_max_load = max_load_factor();
+      tsl_rh_safe_assert(current_max_load > 0.0f && current_max_load <= 1.0f, "Invalid max_load_factor value");
+      
+      // 计算最小需要的桶数量以容纳现有元素
+      const size_type min_required_buckets = size_type(std::ceil(float(size()) / current_max_load));
+      
+      // 确定最终的桶数量
+      const size_type final_bucket_count = std::max(count_, min_required_buckets);
+      
+      // 验证最终桶数量
+      tsl_rh_safe_assert(final_bucket_count >= min_required_buckets, "Final bucket count is less than minimum required");
+      tsl_rh_safe_assert(final_bucket_count <= max_size(), "Final bucket count exceeds maximum allowed size");
+      
+      // 只有当桶数量发生变化时才执行rehash
+      if (final_bucket_count != m_bucket_count) {
+        rehash_impl(final_bucket_count);
+        
+        // 验证rehash结果
+        tsl_rh_safe_assert(m_bucket_count == final_bucket_count, "Rehash failed: bucket count not updated correctly");
+        tsl_rh_safe_assert(m_buckets != nullptr || m_bucket_count == 0, "Rehash failed: buckets pointer is null");
+      }
+    } catch (...) {
+      TSL_RH_THROW_OR_TERMINATE(std::runtime_error, "Unexpected error during rehash operation");
+    }
   }
 
   void reserve(size_type count_) {
-    rehash(size_type(std::ceil(float(count_) / max_load_factor())));
+    try {
+      // 输入参数有效性检查
+      tsl_rh_safe_assert(count_ >= 0, "Invalid reserve count: must be non-negative");
+      tsl_rh_safe_assert(count_ <= max_size(), "Reserve count exceeds maximum allowed size");
+      
+      // 负载因子有效性检查
+      const float current_max_load = max_load_factor();
+      tsl_rh_safe_assert(current_max_load > 0.0f && current_max_load <= 1.0f, "Invalid max_load_factor value");
+      
+      // 计算所需的桶数量
+      const size_type required_buckets = size_type(std::ceil(float(count_) / current_max_load));
+      
+      // 验证计算结果
+      tsl_rh_safe_assert(required_buckets >= count_, "Calculated required buckets is less than requested count");
+      tsl_rh_safe_assert(required_buckets <= max_size(), "Calculated required buckets exceeds maximum allowed size");
+      
+      // 执行rehash
+      rehash(required_buckets);
+      
+      // 验证结果
+      tsl_rh_safe_assert(bucket_count() >= required_buckets, "Reserve failed: bucket count not sufficient");
+    } catch (...) {
+      TSL_RH_THROW_OR_TERMINATE(std::runtime_error, "Unexpected error during reserve operation");
+    }
   }
 
   /*
@@ -1074,30 +1173,57 @@ class robin_hash : private Hash, private KeyEqual, private GrowthPolicy {
   }
 
   std::size_t bucket_for_hash(std::size_t hash) const {
-    const std::size_t bucket = GrowthPolicy::bucket_for_hash(hash);
-    tsl_rh_assert(bucket < m_bucket_count ||
-                  (bucket == 0 && m_bucket_count == 0));
-
-    return bucket;
+    try {
+      const std::size_t bucket = GrowthPolicy::bucket_for_hash(hash);
+      
+      // 桶索引有效性检查
+      tsl_rh_safe_assert(bucket < m_bucket_count || (bucket == 0 && m_bucket_count == 0), 
+                        "Invalid bucket index calculated from hash");
+      tsl_rh_safe_assert(m_bucket_count == 0 || bucket < m_bucket_count, 
+                        "Bucket index out of range");
+      
+      return bucket;
+    } catch (...) {
+      TSL_RH_THROW_OR_TERMINATE(std::runtime_error, "Unexpected error during bucket calculation");
+    }
   }
 
   template <class U = GrowthPolicy,
-            typename std::enable_if<is_power_of_two_policy<U>::value>::type* =
-                nullptr>
-  std::size_t next_bucket(std::size_t index) const noexcept {
-    tsl_rh_assert(index < bucket_count());
-
-    return (index + 1) & this->m_mask;
+            typename std::enable_if<is_power_of_two_policy<U>::value>::type* = nullptr>
+  std::size_t next_bucket(std::size_t index) const {
+    try {
+      // 输入索引有效性检查
+      tsl_rh_safe_assert(index < bucket_count(), "Invalid bucket index: out of range");
+      tsl_rh_safe_assert(bucket_count() > 0, "Cannot get next bucket from empty hash table");
+      
+      const std::size_t next_index = (index + 1) & this->m_mask;
+      
+      // 输出索引有效性检查
+      tsl_rh_safe_assert(next_index < bucket_count(), "Invalid next bucket index: out of range");
+      
+      return next_index;
+    } catch (...) {
+      TSL_RH_THROW_OR_TERMINATE(std::runtime_error, "Unexpected error during next bucket calculation");
+    }
   }
 
   template <class U = GrowthPolicy,
-            typename std::enable_if<!is_power_of_two_policy<U>::value>::type* =
-                nullptr>
-  std::size_t next_bucket(std::size_t index) const noexcept {
-    tsl_rh_assert(index < bucket_count());
-
-    index++;
-    return (index != bucket_count()) ? index : 0;
+            typename std::enable_if<!is_power_of_two_policy<U>::value>::type* = nullptr>
+  std::size_t next_bucket(std::size_t index) const {
+    try {
+      // 输入索引有效性检查
+      tsl_rh_safe_assert(index < bucket_count(), "Invalid bucket index: out of range");
+      tsl_rh_safe_assert(bucket_count() > 0, "Cannot get next bucket from empty hash table");
+      
+      const std::size_t next_index = (index + 1) % bucket_count();
+      
+      // 输出索引有效性检查
+      tsl_rh_safe_assert(next_index < bucket_count(), "Invalid next bucket index: out of range");
+      
+      return next_index;
+    } catch (...) {
+      TSL_RH_THROW_OR_TERMINATE(std::runtime_error, "Unexpected error during next bucket calculation");
+    }
   }
 
   template <class K>
@@ -1108,103 +1234,173 @@ class robin_hash : private Hash, private KeyEqual, private GrowthPolicy {
 
   template <class K>
   const_iterator find_impl(const K& key, std::size_t hash) const {
-    std::size_t ibucket = bucket_for_hash(hash);
-    distance_type dist_from_ideal_bucket = 0;
+    try {
+      // 哈希表状态一致性检查
+      tsl_rh_safe_assert(m_bucket_count == 0 || m_buckets != nullptr, "Hash table has non-zero buckets but null buckets pointer");
+      tsl_rh_safe_assert(m_nb_elements == 0 || m_bucket_count > 0, "Hash table has non-zero elements but zero buckets");
+      tsl_rh_safe_assert(m_nb_elements <= m_bucket_count, "Hash table has more elements than buckets");
+      
+      // 空表快速返回
+      if (m_nb_elements == 0) {
+        return cend();
+      }
+      
+      // 桶数量检查
+      if (m_bucket_count == 0) {
+        tsl_rh_safe_assert(m_nb_elements == 0, "Hash table has non-zero elements but zero buckets");
+        return cend();
+      }
+      
+      std::size_t ibucket = bucket_for_hash(hash);
+      distance_type dist_from_ideal_bucket = 0;
 
-    while (dist_from_ideal_bucket <=
-           m_buckets[ibucket].dist_from_ideal_bucket()) {
-      if (TSL_RH_LIKELY(
-              (!USE_STORED_HASH_ON_LOOKUP ||
-               m_buckets[ibucket].bucket_hash_equal(hash)) &&
-              compare_keys(KeySelect()(m_buckets[ibucket].value()), key))) {
-        return const_iterator(m_buckets + ibucket);
+      // 桶索引有效性检查
+      tsl_rh_safe_assert(ibucket < m_bucket_count, "Invalid bucket index calculated from hash");
+      tsl_rh_safe_assert(m_buckets != nullptr, "Attempt to access null buckets pointer");
+
+      while (dist_from_ideal_bucket <= m_buckets[ibucket].dist_from_ideal_bucket()) {
+        // 桶状态一致性检查
+        tsl_rh_safe_assert(!m_buckets[ibucket].empty(), "Invalid bucket state: empty bucket with non-negative distance");
+        tsl_rh_safe_assert(m_buckets[ibucket].dist_from_ideal_bucket() >= 0, "Invalid bucket distance: negative value");
+        tsl_rh_safe_assert(m_buckets[ibucket].dist_from_ideal_bucket() <= bucket_entry::DIST_FROM_IDEAL_BUCKET_LIMIT, "Invalid bucket distance: exceeds maximum limit");
+        
+        // 键匹配检查
+        if (TSL_RH_LIKELY((!USE_STORED_HASH_ON_LOOKUP || m_buckets[ibucket].bucket_hash_equal(hash)) &&
+                         compare_keys(KeySelect()(m_buckets[ibucket].value()), key))) {
+          return const_iterator(m_buckets + ibucket);
+        }
+
+        // 移动到下一个桶
+        ibucket = next_bucket(ibucket);
+        dist_from_ideal_bucket++;
+        
+        // 边界检查和无限循环防护
+        tsl_rh_safe_assert(ibucket < m_bucket_count, "Invalid bucket index after increment");
+        tsl_rh_safe_assert(dist_from_ideal_bucket <= bucket_entry::DIST_FROM_IDEAL_BUCKET_LIMIT, "Excessive distance from ideal bucket during find - potential infinite loop");
+        tsl_rh_safe_assert(dist_from_ideal_bucket <= m_bucket_count, "Distance exceeds bucket count - potential infinite loop");
       }
 
-      ibucket = next_bucket(ibucket);
-      dist_from_ideal_bucket++;
+      return cend();
+    } catch (...) {
+      TSL_RH_THROW_OR_TERMINATE(std::runtime_error, "Unexpected error during find operation");
     }
-
-    return cend();
   }
 
   void erase_from_bucket(iterator pos) {
-    pos.m_bucket->clear();
-    m_nb_elements--;
+    try {
+      // 空指针和边界检查
+      tsl_rh_safe_assert(pos.m_bucket != nullptr, "Attempt to erase from null iterator");
+      tsl_rh_safe_assert(m_buckets != nullptr, "Attempt to erase from hash table with null buckets pointer");
+      tsl_rh_safe_assert(m_bucket_count > 0, "Attempt to erase from hash table with zero buckets");
+      
+      // 检查迭代器是否有效
+      std::size_t bucket_index = static_cast<std::size_t>(pos.m_bucket - m_buckets);
+      tsl_rh_safe_assert(bucket_index < m_bucket_count, "Invalid bucket index from iterator");
+      tsl_rh_safe_assert(!pos.m_bucket->empty(), "Attempt to erase from empty bucket");
 
-    /**
-     * Backward shift, swap the empty bucket, previous_ibucket, with the values
-     * on its right, ibucket, until we cross another empty bucket or if the
-     * other bucket has a distance_from_ideal_bucket == 0.
-     *
-     * We try to move the values closer to their ideal bucket.
-     */
-    std::size_t previous_ibucket =
-        static_cast<std::size_t>(pos.m_bucket - m_buckets);
-    std::size_t ibucket = next_bucket(previous_ibucket);
+      pos.m_bucket->clear();
+      m_nb_elements--;
 
-    while (m_buckets[ibucket].dist_from_ideal_bucket() > 0) {
-      tsl_rh_assert(m_buckets[previous_ibucket].empty());
+      /**
+       * Backward shift, swap the empty bucket, previous_ibucket, with the values
+       * on its right, ibucket, until we cross another empty bucket or if the
+       * other bucket has a distance_from_ideal_bucket == 0.
+       *
+       * We try to move the values closer to their ideal bucket.
+       */
+      std::size_t previous_ibucket = bucket_index;
+      std::size_t ibucket = next_bucket(previous_ibucket);
 
-      const distance_type new_distance =
-          distance_type(m_buckets[ibucket].dist_from_ideal_bucket() - 1);
-      m_buckets[previous_ibucket].set_value_of_empty_bucket(
-          new_distance, m_buckets[ibucket].truncated_hash(),
-          std::move(m_buckets[ibucket].value()));
-      m_buckets[ibucket].clear();
+      while (m_buckets[ibucket].dist_from_ideal_bucket() > 0) {
+        tsl_rh_safe_assert(m_buckets[previous_ibucket].empty(), "Invalid bucket state: previous bucket should be empty during backward shift");
+        tsl_rh_safe_assert(!m_buckets[ibucket].empty(), "Invalid bucket state: current bucket should not be empty during backward shift");
 
-      previous_ibucket = ibucket;
-      ibucket = next_bucket(ibucket);
+        const distance_type new_distance = 
+            distance_type(m_buckets[ibucket].dist_from_ideal_bucket() - 1);
+        m_buckets[previous_ibucket].set_value_of_empty_bucket(
+            new_distance, m_buckets[ibucket].truncated_hash(),
+            std::move(m_buckets[ibucket].value()));
+        m_buckets[ibucket].clear();
+
+        previous_ibucket = ibucket;
+        ibucket = next_bucket(ibucket);
+        
+        // 防止无限循环
+        tsl_rh_safe_assert(previous_ibucket < m_bucket_count, "Exceeded bucket count during backward shift");
+      }
+      m_try_shrink_on_next_insert = true;
+    } catch (...) {
+      TSL_RH_THROW_OR_TERMINATE(std::runtime_error, 
+                                "Unexpected error during erase");
     }
-    m_try_shrink_on_next_insert = true;
   }
 
   template <class K, class... Args>
   std::pair<iterator, bool> insert_impl(const K& key,
                                         Args&&... value_type_args) {
-    const std::size_t hash = hash_key(key);
+    try {
+      const std::size_t hash = hash_key(key);
 
-    std::size_t ibucket = bucket_for_hash(hash);
-    distance_type dist_from_ideal_bucket = 0;
+      std::size_t ibucket = bucket_for_hash(hash);
+      distance_type dist_from_ideal_bucket = 0;
 
-    while (dist_from_ideal_bucket <=
-           m_buckets[ibucket].dist_from_ideal_bucket()) {
-      if ((!USE_STORED_HASH_ON_LOOKUP ||
-           m_buckets[ibucket].bucket_hash_equal(hash)) &&
-          compare_keys(KeySelect()(m_buckets[ibucket].value()), key)) {
-        return std::make_pair(iterator(m_buckets + ibucket), false);
-      }
-
-      ibucket = next_bucket(ibucket);
-      dist_from_ideal_bucket++;
-    }
-
-    while (rehash_on_extreme_load(dist_from_ideal_bucket)) {
-      ibucket = bucket_for_hash(hash);
-      dist_from_ideal_bucket = 0;
+      // 空指针和边界检查
+      tsl_rh_safe_assert(m_buckets != nullptr, "Attempt to insert into hash table with null buckets pointer");
+      tsl_rh_safe_assert(m_bucket_count > 0 || m_nb_elements == 0, "Hash table has zero buckets but non-zero elements");
+      tsl_rh_safe_assert(ibucket < m_bucket_count, "Invalid bucket index calculated from hash");
 
       while (dist_from_ideal_bucket <=
              m_buckets[ibucket].dist_from_ideal_bucket()) {
+        // 空桶检查
+        tsl_rh_safe_assert(!m_buckets[ibucket].empty(), "Invalid bucket state: empty bucket with non-negative distance");
+        
+        if ((!USE_STORED_HASH_ON_LOOKUP ||
+             m_buckets[ibucket].bucket_hash_equal(hash)) &&
+            compare_keys(KeySelect()(m_buckets[ibucket].value()), key)) {
+          return std::make_pair(iterator(m_buckets + ibucket), false);
+        }
+
         ibucket = next_bucket(ibucket);
         dist_from_ideal_bucket++;
+        
+        // 防止无限循环
+        tsl_rh_safe_assert(dist_from_ideal_bucket <= bucket_entry::DIST_FROM_IDEAL_BUCKET_LIMIT, "Excessive distance from ideal bucket during insert");
       }
-    }
 
-    if (m_buckets[ibucket].empty()) {
-      m_buckets[ibucket].set_value_of_empty_bucket(
-          dist_from_ideal_bucket, bucket_entry::truncate_hash(hash),
-          std::forward<Args>(value_type_args)...);
-    } else {
-      insert_value(ibucket, dist_from_ideal_bucket,
-                   bucket_entry::truncate_hash(hash),
-                   std::forward<Args>(value_type_args)...);
-    }
+      while (rehash_on_extreme_load(dist_from_ideal_bucket)) {
+        ibucket = bucket_for_hash(hash);
+        dist_from_ideal_bucket = 0;
 
-    m_nb_elements++;
-    /*
-     * The value will be inserted in ibucket in any case, either because it was
-     * empty or by stealing the bucket (robin hood).
-     */
-    return std::make_pair(iterator(m_buckets + ibucket), true);
+        while (dist_from_ideal_bucket <=
+               m_buckets[ibucket].dist_from_ideal_bucket()) {
+          ibucket = next_bucket(ibucket);
+          dist_from_ideal_bucket++;
+        }
+      }
+
+      if (m_buckets[ibucket].empty()) {
+        m_buckets[ibucket].set_value_of_empty_bucket(
+            dist_from_ideal_bucket, bucket_entry::truncate_hash(hash),
+            std::forward<Args>(value_type_args)...);
+      } else {
+        insert_value(ibucket, dist_from_ideal_bucket,
+                     bucket_entry::truncate_hash(hash),
+                     std::forward<Args>(value_type_args)...);
+      }
+
+      m_nb_elements++;
+      /*
+       * The value will be inserted in ibucket in any case, either because it was
+       * empty or by stealing the bucket (robin hood).
+       */
+      return std::make_pair(iterator(m_buckets + ibucket), true);
+    } catch (const std::bad_alloc& e) {
+      TSL_RH_THROW_OR_TERMINATE(allocation_error, 
+                                "Memory allocation failed during insert: " + std::string(e.what()));
+    } catch (...) {
+      TSL_RH_THROW_OR_TERMINATE(std::runtime_error, 
+                                "Unexpected error during insert");
+    }
   }
 
   template <class... Args>
@@ -1262,60 +1458,118 @@ class robin_hash : private Hash, private KeyEqual, private GrowthPolicy {
   }
 
   void rehash_impl(size_type count_) {
-    robin_hash new_table(count_, static_cast<Hash&>(*this),
-                         static_cast<KeyEqual&>(*this), get_allocator(),
-                         m_min_load_factor, m_max_load_factor);
-    tsl_rh_assert(size() <= new_table.m_load_threshold);
+    try {
+      robin_hash new_table(count_, static_cast<Hash&>(*this),
+                           static_cast<KeyEqual&>(*this), get_allocator(),
+                           m_min_load_factor, m_max_load_factor);
+      tsl_rh_assert(size() <= new_table.m_load_threshold);
 
-    const bool use_stored_hash =
-        USE_STORED_HASH_ON_REHASH(new_table.bucket_count());
-    for (auto& bucket : m_buckets_data) {
-      if (bucket.empty()) {
-        continue;
+      const bool use_stored_hash = 
+          USE_STORED_HASH_ON_REHASH(new_table.bucket_count());
+      for (auto& bucket : m_buckets_data) {
+        if (bucket.empty()) {
+          continue;
+        }
+
+        const std::size_t hash = 
+            use_stored_hash ? bucket.truncated_hash()
+                            : new_table.hash_key(KeySelect()(bucket.value()));
+
+        new_table.insert_value_on_rehash(new_table.bucket_for_hash(hash), 0,
+                                         bucket_entry::truncate_hash(hash),
+                                         std::move(bucket.value()));
       }
 
-      const std::size_t hash =
-          use_stored_hash ? bucket.truncated_hash()
-                          : new_table.hash_key(KeySelect()(bucket.value()));
-
-      new_table.insert_value_on_rehash(new_table.bucket_for_hash(hash), 0,
-                                       bucket_entry::truncate_hash(hash),
-                                       std::move(bucket.value()));
+      new_table.m_nb_elements = m_nb_elements;
+      new_table.swap(*this);
+    } catch (const std::bad_alloc& e) {
+      TSL_RH_THROW_OR_TERMINATE(allocation_error, 
+                                "Memory allocation failed during rehash: " + std::string(e.what()));
+    } catch (...) {
+      TSL_RH_THROW_OR_TERMINATE(std::runtime_error, 
+                                "Unexpected error during rehash");
     }
-
-    new_table.m_nb_elements = m_nb_elements;
-    new_table.swap(*this);
   }
 
-  void clear_and_shrink() noexcept {
-    GrowthPolicy::clear();
-    m_buckets_data.clear();
-    m_buckets = static_empty_bucket_ptr();
-    m_bucket_count = 0;
-    m_nb_elements = 0;
-    m_load_threshold = 0;
-    m_grow_on_next_insert = false;
-    m_try_shrink_on_next_insert = false;
+  void clear_and_shrink() {
+    try {
+      // 哈希表状态一致性检查
+      tsl_rh_safe_assert(m_bucket_count == 0 || m_buckets != nullptr, "Hash table has non-zero buckets but null buckets pointer");
+      tsl_rh_safe_assert(m_bucket_count == 0 || m_buckets_data.data() != nullptr, "Hash table has non-zero buckets but null buckets data pointer");
+      
+      // 清除增长策略
+      GrowthPolicy::clear();
+      
+      // 清除桶数据
+      if (!m_buckets_data.empty()) {
+        m_buckets_data.clear();
+        
+        // 验证桶数据已被清除
+        tsl_rh_safe_assert(m_buckets_data.empty(), "Failed to clear buckets data");
+      }
+      
+      // 更新状态指针和计数器
+      m_buckets = static_empty_bucket_ptr();
+      m_bucket_count = 0;
+      m_nb_elements = 0;
+      m_load_threshold = 0;
+      m_grow_on_next_insert = false;
+      m_try_shrink_on_next_insert = false;
+      
+      // 最终状态验证
+      tsl_rh_safe_assert(m_bucket_count == 0, "Clear and shrink failed: bucket count not zero");
+      tsl_rh_safe_assert(m_nb_elements == 0, "Clear and shrink failed: element count not zero");
+      tsl_rh_safe_assert(m_buckets == static_empty_bucket_ptr(), "Clear and shrink failed: buckets pointer not reset");
+      tsl_rh_safe_assert(m_buckets_data.empty(), "Clear and shrink failed: buckets data not empty");
+      tsl_rh_safe_assert(m_load_threshold == 0, "Clear and shrink failed: load threshold not reset");
+    } catch (...) {
+      TSL_RH_THROW_OR_TERMINATE(std::runtime_error, "Unexpected error during clear and shrink operation");
+    }
   }
 
   void insert_value_on_rehash(std::size_t ibucket,
                               distance_type dist_from_ideal_bucket,
                               truncated_hash_type hash, value_type&& value) {
-    while (true) {
-      if (dist_from_ideal_bucket >
-          m_buckets[ibucket].dist_from_ideal_bucket()) {
-        if (m_buckets[ibucket].empty()) {
-          m_buckets[ibucket].set_value_of_empty_bucket(dist_from_ideal_bucket,
-                                                       hash, std::move(value));
-          return;
-        } else {
-          m_buckets[ibucket].swap_with_value_in_bucket(dist_from_ideal_bucket,
-                                                       hash, value);
+    try {
+      // 输入参数有效性检查
+      tsl_rh_safe_assert(ibucket < m_bucket_count, "Invalid bucket index: out of range");
+      tsl_rh_safe_assert(dist_from_ideal_bucket >= 0, "Invalid distance: must be non-negative");
+      tsl_rh_safe_assert(m_buckets != nullptr, "Attempt to access null buckets pointer");
+      tsl_rh_safe_assert(m_bucket_count > 0, "Cannot insert into empty hash table");
+      
+      // 防止无限循环的保护
+      const std::size_t max_iterations = m_bucket_count * 2; // 安全限制
+      std::size_t iterations = 0;
+      
+      while (true) {
+        // 迭代次数检查，防止无限循环
+        tsl_rh_safe_assert(iterations < max_iterations, "Insert on rehash failed: infinite loop detected");
+        iterations++;
+        
+        // 桶索引有效性检查
+        tsl_rh_safe_assert(ibucket < m_bucket_count, "Invalid bucket index during insert on rehash");
+        
+        // 距离有效性检查
+        tsl_rh_safe_assert(dist_from_ideal_bucket >= 0, "Invalid distance during insert on rehash");
+        tsl_rh_safe_assert(dist_from_ideal_bucket <= bucket_entry::DIST_FROM_IDEAL_BUCKET_LIMIT, 
+                          "Distance exceeds maximum allowed limit");
+        
+        if (dist_from_ideal_bucket > m_buckets[ibucket].dist_from_ideal_bucket()) {
+          if (m_buckets[ibucket].empty()) {
+            // 插入到空桶
+            m_buckets[ibucket].set_value_of_empty_bucket(dist_from_ideal_bucket, hash, std::move(value));
+            return;
+          } else {
+            // 与现有桶交换
+            m_buckets[ibucket].swap_with_value_in_bucket(dist_from_ideal_bucket, hash, value);
+          }
         }
-      }
 
-      dist_from_ideal_bucket++;
-      ibucket = next_bucket(ibucket);
+        dist_from_ideal_bucket++;
+        ibucket = next_bucket(ibucket);
+      }
+    } catch (...) {
+      TSL_RH_THROW_OR_TERMINATE(std::runtime_error, "Unexpected error during insert on rehash operation");
     }
   }
 
@@ -1327,37 +1581,82 @@ class robin_hash : private Hash, private KeyEqual, private GrowthPolicy {
    * Return true if the table has been rehashed.
    */
   bool rehash_on_extreme_load(distance_type curr_dist_from_ideal_bucket) {
-    if (m_grow_on_next_insert ||
-        curr_dist_from_ideal_bucket >
-            bucket_entry::DIST_FROM_IDEAL_BUCKET_LIMIT ||
-        size() >= m_load_threshold) {
-      rehash_impl(GrowthPolicy::next_bucket_count());
-      m_grow_on_next_insert = false;
+    try {
+      // 输入参数有效性检查
+      tsl_rh_safe_assert(curr_dist_from_ideal_bucket >= 0, "Invalid distance: must be non-negative");
+      
+      // 哈希表状态一致性检查
+      tsl_rh_safe_assert(m_bucket_count == 0 || m_buckets != nullptr, "Hash table has non-zero buckets but null buckets pointer");
+      tsl_rh_safe_assert(m_nb_elements <= m_bucket_count, "Invalid state: more elements than buckets");
+      
+      // 检查是否需要扩容
+      if (m_grow_on_next_insert ||
+          curr_dist_from_ideal_bucket > bucket_entry::DIST_FROM_IDEAL_BUCKET_LIMIT ||
+          size() >= m_load_threshold) {
+        
+        // 计算新的桶数量
+        const std::size_t next_bucket_count = GrowthPolicy::next_bucket_count();
+        tsl_rh_safe_assert(next_bucket_count > m_bucket_count, "Next bucket count must be larger than current");
+        
+        // 执行扩容
+        rehash_impl(next_bucket_count);
+        m_grow_on_next_insert = false;
 
-      return true;
-    }
-
-    if (m_try_shrink_on_next_insert) {
-      m_try_shrink_on_next_insert = false;
-      if (m_min_load_factor != 0.0f && load_factor() < m_min_load_factor) {
-        reserve(size() + 1);
-
+        // 验证扩容结果
+        tsl_rh_safe_assert(m_bucket_count == next_bucket_count, "Rehash failed: bucket count not updated correctly");
+        tsl_rh_safe_assert(m_buckets != nullptr, "Rehash failed: buckets pointer is null");
+        
         return true;
       }
-    }
 
-    return false;
+      // 检查是否需要缩容
+      if (m_try_shrink_on_next_insert) {
+        m_try_shrink_on_next_insert = false;
+        
+        // 验证负载因子有效性
+        tsl_rh_safe_assert(m_min_load_factor >= 0.0f && m_min_load_factor <= 1.0f, "Invalid min_load_factor value");
+        
+        if (m_min_load_factor != 0.0f && load_factor() < m_min_load_factor) {
+          // 计算新的容量
+          const std::size_t new_capacity = size() + 1;
+          tsl_rh_safe_assert(new_capacity <= m_bucket_count, "New capacity must be less than or equal to current bucket count");
+          
+          // 执行缩容
+          reserve(new_capacity);
+
+          // 验证缩容结果
+          tsl_rh_safe_assert(m_bucket_count >= new_capacity, "Reserve failed: bucket count not sufficient");
+          
+          return true;
+        }
+      }
+
+      return false;
+    } catch (...) {
+      TSL_RH_THROW_OR_TERMINATE(std::runtime_error, "Unexpected error during rehash on extreme load operation");
+    }
   }
 
   template <class Serializer>
   void serialize_impl(Serializer& serializer) const {
-    const slz_size_type version = SERIALIZATION_PROTOCOL_VERSION;
-    serializer(version);
+    try {
+      // 空指针检查
+      tsl_rh_safe_assert(m_buckets != nullptr || m_bucket_count == 0, "Attempt to serialize hash table with null buckets pointer");
+      
+      // 数据完整性检查
+      tsl_rh_safe_assert(m_nb_elements <= m_bucket_count, "Invalid state: more elements than buckets");
+      tsl_rh_safe_assert(m_min_load_factor >= MINIMUM_MIN_LOAD_FACTOR && m_min_load_factor <= MAXIMUM_MIN_LOAD_FACTOR, "Invalid min_load_factor value");
+      tsl_rh_safe_assert(m_max_load_factor >= MINIMUM_MAX_LOAD_FACTOR && m_max_load_factor <= MAXIMUM_MAX_LOAD_FACTOR, "Invalid max_load_factor value");
+      tsl_rh_safe_assert(m_bucket_count == 0 || m_buckets_data.data() != nullptr, "Hash table has non-zero buckets but null buckets data pointer");
+      
+      // 序列化协议版本
+      const slz_size_type version = SERIALIZATION_PROTOCOL_VERSION;
+      serializer(version);
 
     // Indicate if the truncated hash of each bucket is stored. Use a
     // std::int16_t instead of a bool to avoid the need for the serializer to
     // support an extra 'bool' type.
-    const std::int16_t hash_stored_for_bucket =
+    const std::int16_t hash_stored_for_bucket = 
         static_cast<std::int16_t>(STORE_HASH);
     serializer(hash_stored_for_bucket);
 
@@ -1373,14 +1672,31 @@ class robin_hash : private Hash, private KeyEqual, private GrowthPolicy {
     const float max_load_factor = m_max_load_factor;
     serializer(max_load_factor);
 
+    // 计算并序列化校验和
+    std::uint32_t checksum = 0;
+    for (const bucket_entry& bucket : m_buckets_data) {
+      if (!bucket.empty()) {
+        // 简单的校验和计算，实际项目中可以使用更复杂的算法
+        checksum ^= static_cast<std::uint32_t>(bucket.dist_from_ideal_bucket());
+        if (STORE_HASH) {
+          checksum ^= bucket.truncated_hash();
+        }
+      }
+    }
+    serializer(checksum);
+
     for (const bucket_entry& bucket : m_buckets_data) {
       if (bucket.empty()) {
-        const std::int16_t empty_bucket =
+        const std::int16_t empty_bucket = 
             bucket_entry::EMPTY_MARKER_DIST_FROM_IDEAL_BUCKET;
         serializer(empty_bucket);
       } else {
-        const std::int16_t dist_from_ideal_bucket =
+        const std::int16_t dist_from_ideal_bucket = 
             bucket.dist_from_ideal_bucket();
+        
+        // 边界检查
+        tsl_rh_safe_assert(dist_from_ideal_bucket >= 0 && dist_from_ideal_bucket <= bucket_entry::DIST_FROM_IDEAL_BUCKET_LIMIT, "Invalid distance from ideal bucket");
+        
         serializer(dist_from_ideal_bucket);
         if (STORE_HASH) {
           const std::uint32_t truncated_hash = bucket.truncated_hash();
@@ -1389,23 +1705,34 @@ class robin_hash : private Hash, private KeyEqual, private GrowthPolicy {
         serializer(bucket.value());
       }
     }
+    } catch (...) {
+      TSL_RH_THROW_OR_TERMINATE(std::runtime_error, "Unexpected error during serialization operation");
+    }
   }
 
   template <class Deserializer>
   void deserialize_impl(Deserializer& deserializer, bool hash_compatible) {
-    tsl_rh_assert(m_buckets_data.empty());  // Current hash table must be empty
+    try {
+      tsl_rh_assert(m_buckets_data.empty());  // Current hash table must be empty
+      
+      // 空指针安全检查
+      tsl_rh_safe_assert(&deserializer != nullptr, "Deserializer pointer is null");
+      
+      // 验证当前哈希表为空
+      tsl_rh_safe_assert(m_nb_elements == 0, "Cannot deserialize into non-empty hash table");
+      tsl_rh_safe_assert(m_bucket_count == 0, "Cannot deserialize into non-empty hash table");
+      
+      const slz_size_type version = 
+          deserialize_value<slz_size_type>(deserializer);
+      // For now we only have one version of the serialization protocol.
+      // If it doesn't match there is a problem with the file.
+      if (version != SERIALIZATION_PROTOCOL_VERSION) {
+        TSL_RH_THROW_OR_TERMINATE(std::runtime_error,
+                                  "Can't deserialize the ordered_map/set. "
+                                  "The protocol version header is invalid.");
+      }
 
-    const slz_size_type version =
-        deserialize_value<slz_size_type>(deserializer);
-    // For now we only have one version of the serialization protocol.
-    // If it doesn't match there is a problem with the file.
-    if (version != SERIALIZATION_PROTOCOL_VERSION) {
-      TSL_RH_THROW_OR_TERMINATE(std::runtime_error,
-                                "Can't deserialize the ordered_map/set. "
-                                "The protocol version header is invalid.");
-    }
-
-    const bool hash_stored_for_bucket =
+    const bool hash_stored_for_bucket = 
         deserialize_value<std::int16_t>(deserializer) ? true : false;
     if (hash_compatible && STORE_HASH != hash_stored_for_bucket) {
       TSL_RH_THROW_OR_TERMINATE(
@@ -1415,12 +1742,20 @@ class robin_hash : private Hash, private KeyEqual, private GrowthPolicy {
           "hash compatibility is used");
     }
 
-    const slz_size_type nb_elements =
+    const slz_size_type nb_elements = 
         deserialize_value<slz_size_type>(deserializer);
-    const slz_size_type bucket_count_ds =
+    const slz_size_type bucket_count_ds = 
         deserialize_value<slz_size_type>(deserializer);
     const float min_load_factor = deserialize_value<float>(deserializer);
     const float max_load_factor = deserialize_value<float>(deserializer);
+
+    // 数据完整性校验：元素数量不能超过桶数量
+    tsl_rh_safe_assert(nb_elements <= bucket_count_ds || bucket_count_ds == 0, 
+                      "Number of elements exceeds bucket count");
+    
+    // 桶数量边界检查
+    tsl_rh_safe_assert(bucket_count_ds <= max_size(), 
+                      "Deserialized bucket count exceeds maximum allowed size");
 
     if (min_load_factor < MINIMUM_MIN_LOAD_FACTOR ||
         min_load_factor > MAXIMUM_MIN_LOAD_FACTOR) {
@@ -1447,17 +1782,30 @@ class robin_hash : private Hash, private KeyEqual, private GrowthPolicy {
       tsl_rh_assert(nb_elements == 0);
       return;
     }
+    
+    // 负载因子合理性检查
+    tsl_rh_safe_assert(max_load_factor > 0.0f && max_load_factor <= 1.0f, 
+                      "Invalid max_load_factor value");
+    tsl_rh_safe_assert(min_load_factor >= 0.0f && min_load_factor < max_load_factor, 
+                      "Invalid min_load_factor value relative to max_load_factor");
 
     if (!hash_compatible) {
       reserve(numeric_cast<size_type>(nb_elements,
                                       "Deserialized nb_elements is too big."));
       for (slz_size_type ibucket = 0; ibucket < bucket_count_ds; ibucket++) {
-        const distance_type dist_from_ideal_bucket =
+        const distance_type dist_from_ideal_bucket = 
             deserialize_value<std::int16_t>(deserializer);
-        if (dist_from_ideal_bucket !=
+            
+        // 距离边界检查
+        tsl_rh_safe_assert(dist_from_ideal_bucket == bucket_entry::EMPTY_MARKER_DIST_FROM_IDEAL_BUCKET || 
+                          (dist_from_ideal_bucket >= 0 && dist_from_ideal_bucket < static_cast<distance_type>(bucket_count_ds)), 
+                          "Invalid distance from ideal bucket");
+                          
+        if (dist_from_ideal_bucket != 
             bucket_entry::EMPTY_MARKER_DIST_FROM_IDEAL_BUCKET) {
           if (hash_stored_for_bucket) {
-            TSL_RH_UNUSED(deserialize_value<std::uint32_t>(deserializer));
+            const std::uint32_t hash = deserialize_value<std::uint32_t>(deserializer);
+            TSL_RH_UNUSED(hash);
           }
 
           insert(deserialize_value<value_type>(deserializer));
@@ -1487,9 +1835,15 @@ class robin_hash : private Hash, private KeyEqual, private GrowthPolicy {
       m_buckets = m_buckets_data.data();
 
       for (bucket_entry& bucket : m_buckets_data) {
-        const distance_type dist_from_ideal_bucket =
+        const distance_type dist_from_ideal_bucket = 
             deserialize_value<std::int16_t>(deserializer);
-        if (dist_from_ideal_bucket !=
+            
+        // 距离边界检查
+        tsl_rh_safe_assert(dist_from_ideal_bucket == bucket_entry::EMPTY_MARKER_DIST_FROM_IDEAL_BUCKET || 
+                          (dist_from_ideal_bucket >= 0 && dist_from_ideal_bucket < static_cast<distance_type>(m_bucket_count)), 
+                          "Invalid distance from ideal bucket");
+                          
+        if (dist_from_ideal_bucket != 
             bucket_entry::EMPTY_MARKER_DIST_FROM_IDEAL_BUCKET) {
           truncated_hash_type truncated_hash = 0;
           if (hash_stored_for_bucket) {
@@ -1506,6 +1860,9 @@ class robin_hash : private Hash, private KeyEqual, private GrowthPolicy {
       if (!m_buckets_data.empty()) {
         m_buckets_data.back().set_as_last_bucket();
       }
+    }
+    } catch (...) {
+      TSL_RH_THROW_OR_TERMINATE(std::runtime_error, "Unexpected error during deserialization operation");
     }
   }
 

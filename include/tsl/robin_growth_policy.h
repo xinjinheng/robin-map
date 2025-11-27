@@ -34,6 +34,112 @@
 #include <limits>
 #include <ratio>
 #include <stdexcept>
+#include <string>
+
+// Safe mode switch. Set to 1 to enable runtime safety checks, 0 to disable.
+#ifndef TSL_ROBIN_MAP_SAFE_MODE
+#define TSL_ROBIN_MAP_SAFE_MODE 0
+#endif
+
+// Safe mode assertion macro
+#if TSL_ROBIN_MAP_SAFE_MODE
+#include <stdexcept>
+#define tsl_rh_safe_assert(condition, message) \
+    do { \
+        if (!(condition)) { \
+            throw tsl::rh::safe_mode_error(message); \
+        } \
+    } while (false)
+#else
+#define tsl_rh_safe_assert(condition, message) \
+    do { \
+        TSL_RH_UNUSED(message); \
+        tsl_rh_assert(condition); \
+    } while (false)
+#endif
+
+namespace tsl {
+namespace rh {
+
+/**
+ * Base exception class for all robin-map safe mode errors.
+ */
+class safe_mode_error : public std::runtime_error {
+public:
+    explicit safe_mode_error(const std::string& message) 
+        : std::runtime_error(message) {} 
+    explicit safe_mode_error(const char* message) 
+        : std::runtime_error(message) {} 
+};
+
+/**
+ * Exception thrown when a null pointer is accessed.
+ */
+class null_pointer_error : public safe_mode_error {
+public:
+    explicit null_pointer_error(const std::string& message) 
+        : safe_mode_error(message) {} 
+    explicit null_pointer_error(const char* message) 
+        : safe_mode_error(message) {} 
+};
+
+/**
+ * Exception thrown when an index is out of bounds.
+ */
+class out_of_bounds_error : public safe_mode_error {
+public:
+    explicit out_of_bounds_error(const std::string& message) 
+        : safe_mode_error(message) {} 
+    explicit out_of_bounds_error(const char* message) 
+        : safe_mode_error(message) {} 
+};
+
+/**
+ * Exception thrown when a hash value is invalid.
+ */
+class invalid_hash_error : public safe_mode_error {
+public:
+    explicit invalid_hash_error(const std::string& message) 
+        : safe_mode_error(message) {} 
+    explicit invalid_hash_error(const char* message) 
+        : safe_mode_error(message) {} 
+};
+
+/**
+ * Exception thrown when serialization/deserialization fails.
+ */
+class serialization_error : public safe_mode_error {
+public:
+    explicit serialization_error(const std::string& message) 
+        : safe_mode_error(message) {} 
+    explicit serialization_error(const char* message) 
+        : safe_mode_error(message) {} 
+};
+
+/**
+ * Exception thrown when memory allocation fails.
+ */
+class allocation_error : public safe_mode_error {
+public:
+    explicit allocation_error(const std::string& message) 
+        : safe_mode_error(message) {} 
+    explicit allocation_error(const char* message) 
+        : safe_mode_error(message) {} 
+};
+
+/**
+ * Exception thrown when an iterator is invalid.
+ */
+class invalid_iterator_error : public safe_mode_error {
+public:
+    explicit invalid_iterator_error(const std::string& message) 
+        : safe_mode_error(message) {} 
+    explicit invalid_iterator_error(const char* message) 
+        : safe_mode_error(message) {} 
+};
+
+} // namespace rh
+} // namespace tsl
 
 // A change of the major version indicates an API and/or ABI break (change of
 // in-memory layout of the data structure)
@@ -44,12 +150,6 @@
 // A change of the patch version indicates a bugfix without additional
 // functionality
 #define TSL_RH_VERSION_PATCH 1
-
-#ifdef TSL_DEBUG
-#define tsl_rh_assert(expr) assert(expr)
-#else
-#define tsl_rh_assert(expr) (static_cast<void>(0))
-#endif
 
 /**
  * If exceptions are enabled, throw the exception passed in parameter, otherwise
